@@ -2,6 +2,7 @@ extends Node2D
 
 const BALL_SCENE := preload("res://scenes/ball.tscn")
 const BallScript := preload("res://scripts/ball.gd")
+const SpikeIndicatorScene: PackedScene = preload("res://scenes/spike_indicator.tscn")
 const BULLET_TIME_SCALE := 0.35
 const BULLET_TIME_ENTER := 0.12
 const BULLET_TIME_HOLD := 0.18
@@ -47,6 +48,9 @@ var _incoming_obstacle: ObstacleSegment = null
 var _retiring_obstacles: Array[ObstacleSegment] = []
 var _current_obstacle_config: Dictionary = {}
 var _pending_obstacle_config: Dictionary = {}
+var _next_obstacle_config: Dictionary = {}
+var _indicator_config: Dictionary = {}
+var _spike_indicator: SpikeIndicator
 var _combo_base_color := Color(1, 1, 1, 0.32)
 var _blur_tween: Tween
 var _label_tween: Tween
@@ -92,6 +96,11 @@ func _setup_ui() -> void:
 		_combo_label.scale = Vector2.ONE
 		_combo_base_color = _combo_label.modulate
 		_combo_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_combo_label.pivot_offset = _combo_label.size * 0.5
+		var resized_callable := Callable(self, "_on_combo_label_resized")
+		if not _combo_label.is_connected("resized", resized_callable):
+			_combo_label.resized.connect(resized_callable)
+		call_deferred("_update_combo_label_pivot")
 	if _blur_rect:
 		if not _blur_material:
 			var shader := load("res://shaders/flash_blur.gdshader") as Shader
@@ -107,6 +116,13 @@ func _setup_ui() -> void:
 	if _blur_material:
 		_blur_material.set_shader_parameter("intensity", 0.0)
 		_blur_material.set_shader_parameter("freeze_amount", 0.0)
+
+func _on_combo_label_resized() -> void:
+	_update_combo_label_pivot()
+
+func _update_combo_label_pivot() -> void:
+	if _combo_label:
+		_combo_label.pivot_offset = _combo_label.size * 0.5
 
 func _setup_audio() -> void:
 	_audio_player = AudioStreamPlayer.new()
@@ -272,6 +288,94 @@ func _initialize_obstacle() -> void:
 	_pending_obstacle_config.clear()
 	var initial_config := _generate_obstacle_config()
 	_replace_obstacle_immediate(initial_config)
+	_prepare_next_indicator(initial_config)
+
+func _ensure_spike_indicator() -> SpikeIndicator:
+	if not _obstacles_container:
+		return null
+	if not is_instance_valid(_spike_indicator):
+		_spike_indicator = SpikeIndicatorScene.instantiate() as SpikeIndicator
+		_spike_indicator.tile_size = wall_thickness
+		_spike_indicator.spike_length = wall_thickness
+		_spike_indicator.z_index = 5
+		_spike_indicator.z_as_relative = false
+		_spike_indicator.set_visible_amount(0.0)
+		_obstacles_container.add_child(_spike_indicator)
+	return _spike_indicator
+
+func _prepare_next_indicator(current_config: Dictionary) -> void:
+	if not _obstacles_container:
+		return
+	if current_config.is_empty():
+		_hide_indicator(true)
+		return
+	_next_obstacle_config = _generate_obstacle_config(current_config)
+	_indicator_config = _next_obstacle_config.duplicate(true)
+	_show_indicator_for_config(_indicator_config, true)
+
+func _show_indicator_for_config(config: Dictionary, animated: bool) -> void:
+	if config.is_empty():
+		_hide_indicator(animated)
+		return
+	var indicator := _ensure_spike_indicator()
+	if not indicator:
+		return
+	indicator.tile_size = wall_thickness
+	indicator.spike_length = wall_thickness
+	var base: Vector2 = config.get("base", Vector2.ZERO) as Vector2
+	var direction: Vector2 = _quantize_direction(config.get("direction", Vector2.DOWN) as Vector2)
+	indicator.set_direction(direction)
+	indicator.position = _indicator_origin_for_config(base, direction)
+	if animated:
+		indicator.set_visible_amount(0.0)
+		indicator.animate_show()
+	else:
+		indicator.set_visible_amount(1.0)
+
+func _hide_indicator(animated: bool) -> void:
+	if not is_instance_valid(_spike_indicator):
+		return
+	if animated:
+		_spike_indicator.animate_hide()
+	else:
+		_spike_indicator.set_visible_amount(0.0)
+
+func _consume_indicator_for_config(target_config: Dictionary) -> void:
+	if _indicator_config.is_empty():
+		return
+	if not _configs_equivalent(_indicator_config, target_config):
+		return
+	_hide_indicator(true)
+	_indicator_config.clear()
+
+func _quantize_direction(direction: Vector2) -> Vector2:
+	var dir := direction.normalized()
+	if abs(dir.x) > abs(dir.y):
+		return Vector2.RIGHT if dir.x >= 0.0 else Vector2.LEFT
+	return Vector2.DOWN if dir.y >= 0.0 else Vector2.UP
+
+func _indicator_origin_for_config(base: Vector2, direction: Vector2) -> Vector2:
+	var half_tile := wall_thickness * 0.5
+	if direction == Vector2.DOWN:
+		return Vector2(base.x - half_tile, base.y)
+	if direction == Vector2.UP:
+		return Vector2(base.x - half_tile, base.y - wall_thickness)
+	if direction == Vector2.RIGHT:
+		return Vector2(base.x, base.y - half_tile)
+	return Vector2(base.x - wall_thickness, base.y - half_tile)
+
+func _configs_equivalent(a: Dictionary, b: Dictionary) -> bool:
+	if a.is_empty() or b.is_empty():
+		return false
+	var base_a: Vector2 = a.get("base", Vector2.ZERO) as Vector2
+	var base_b: Vector2 = b.get("base", Vector2.ZERO) as Vector2
+	if base_a.distance_squared_to(base_b) > 0.25:
+		return false
+	var dir_a: Vector2 = (a.get("direction", Vector2.ZERO) as Vector2).normalized()
+	var dir_b: Vector2 = (b.get("direction", Vector2.ZERO) as Vector2).normalized()
+	if dir_a.dot(dir_b) < 0.995:
+		return false
+	return true
 
 func _generate_obstacle_config(exclude_config: Dictionary = {}) -> Dictionary:
 	var attempt := 0
@@ -357,25 +461,29 @@ func _apply_obstacle_config(config: Dictionary) -> void:
 		_obstacle.set_damage_ratio(0.0)
 
 func _cycle_obstacle(immediate: bool = false) -> void:
-	var previous_config := _current_obstacle_config.duplicate(true)
-	var next_config := _generate_obstacle_config(previous_config)
+	var next_config := _next_obstacle_config.duplicate(true)
+	if next_config.is_empty():
+		next_config = _generate_obstacle_config(_current_obstacle_config)
+	_consume_indicator_for_config(next_config)
 	if immediate:
 		_replace_obstacle_immediate(next_config)
+		_prepare_next_indicator(_current_obstacle_config)
 	else:
 		_start_obstacle_transition(next_config)
 
 func _force_obstacle_retract_on_bottom_bounce() -> void:
-	var previous_config := _current_obstacle_config.duplicate(true)
-	var next_config := _generate_obstacle_config(previous_config)
-	_start_obstacle_transition(next_config)
+	_cycle_obstacle(false)
 
 func _start_obstacle_transition(next_config: Dictionary) -> void:
 	if next_config.is_empty():
 		next_config = _generate_obstacle_config(_current_obstacle_config)
+	_consume_indicator_for_config(next_config)
+	_next_obstacle_config = next_config.duplicate(true)
 	if _obstacle_animating or _incoming_obstacle:
 		_pending_obstacle_config = next_config.duplicate(true)
 		_obstacle_pending_cycle = true
 		return
+	_next_obstacle_config.clear()
 	_obstacle_hits = 0
 	_obstacle_pending_cycle = false
 	if is_instance_valid(_obstacle) and _obstacle.has_method("set_damage_ratio"):
@@ -393,6 +501,7 @@ func _start_obstacle_transition(next_config: Dictionary) -> void:
 	new_obstacle.configure(next_config.get("base", Vector2.ZERO), next_config.get("direction", Vector2.DOWN), wall_thickness)
 	new_obstacle.set_length_immediate(0.0)
 	_current_obstacle_config = next_config.duplicate(true)
+	_prepare_next_indicator(_current_obstacle_config)
 	_obstacle = new_obstacle
 	_incoming_obstacle = new_obstacle
 	_obstacle_animating = true
@@ -509,8 +618,15 @@ func _spawn_ball() -> void:
 func _on_ball_bottom_bounce() -> void:
 	if not _bottom_active:
 		return
-	_ball.boost_speed()
-	_bounce_count += 1
+	var next_bounce := _bounce_count + 1
+	var should_reset := next_bounce % 20 == 0
+	if should_reset and is_instance_valid(_ball):
+		_ball.restore_initial_speed()
+	elif is_instance_valid(_ball):
+		_ball.boost_speed()
+	_bounce_count = next_bounce
+	if should_reset:
+		_current_frequency = base_frequency
 	_play_bounce_tone()
 	_flash_combo_effect()
 	_force_obstacle_retract_on_bottom_bounce()
