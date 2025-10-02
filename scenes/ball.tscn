@@ -1,0 +1,14 @@
+[gd_scene format=3 uid="uid://ballscene" load_steps=2]
+
+[ext_resource type="Script" path="res://scripts/ball.gd" id="1_wgevi"]
+
+[sub_resource type="CircleShape2D" id="1_w44yf"]
+radius = 12.0
+
+[node name="Ball" type="CharacterBody2D"]
+collision_layer = 1
+collision_mask = 1
+script = ExtResource("1_wgevi")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="."]
+shape = SubResource("1_w44yf")
