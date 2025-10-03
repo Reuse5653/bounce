@@ -46,12 +46,12 @@ void fragment() {
     float freeze = clamp(freeze_amount, 0.0, 1.0);
     if (freeze > 0.0001) {
         float eased_freeze = pow(freeze, 0.85);
-        vec3 desaturated = vec3(dot(final_rgb, vec3(0.299, 0.587, 0.114)));
-        vec3 frost_tint = mix(desaturated, vec3(0.82, 0.92, 1.0), eased_freeze * 0.9);
+    vec3 desaturated = vec3(dot(final_rgb, vec3(0.299, 0.587, 0.114)));
+    vec3 frost_tint = mix(desaturated, vec3(1.0), eased_freeze * 0.5);
         float vignette = smoothstep(0.2, 0.95, length(SCREEN_UV - vec2(0.5)));
-        final_rgb = mix(final_rgb, frost_tint, eased_freeze * 0.85);
-        final_rgb *= mix(1.0, 1.18, eased_freeze);
-        final_rgb = mix(final_rgb, final_rgb * (1.0 - vignette * 0.35 * eased_freeze), eased_freeze * 0.65);
+    final_rgb = mix(final_rgb, frost_tint, eased_freeze * 0.6);
+    final_rgb *= mix(1.0, 1.09, eased_freeze);
+    final_rgb = mix(final_rgb, final_rgb * (1.0 - vignette * 0.35 * eased_freeze), eased_freeze * 0.325);
     }
 
     COLOR = vec4(final_rgb, base_color.a);

@@ -7,6 +7,9 @@ const BULLET_TIME_SCALE := 0.35
 const BULLET_TIME_ENTER := 0.12
 const BULLET_TIME_HOLD := 0.18
 const BULLET_TIME_EXIT := 0.45
+const FAST_FORWARD_STAGE1_DELAY := 0.3
+const FAST_FORWARD_STAGE2_DURATION := 0.5
+const FAST_FORWARD_STAGE2_END := FAST_FORWARD_STAGE1_DELAY + FAST_FORWARD_STAGE2_DURATION
 
 @export var arena_size: float = 640.0
 @export var wall_thickness: float = 20.0
@@ -15,7 +18,9 @@ const BULLET_TIME_EXIT := 0.45
 @export var bottom_active_duration: float = 0.1
 @export var bottom_fade_duration: float = 0.2
 @export_range(0.0, 1.0, 0.01) var bottom_ghost_alpha: float = 0.35
-@export_range(0.0, 1.0, 0.01) var bottom_bounce_alpha_threshold: float = 0.6
+@export_range(0.0, 1.0, 0.01) var bottom_bounce_alpha_threshold: float = 0.75
+@export var bottom_rearm_cooldown: float = 0.3
+@export var bottom_rearm_cooldown_min: float = 0.1
 
 var arena_rect: Rect2
 @onready var _background_rect: ColorRect = $Background
@@ -32,7 +37,9 @@ enum BottomWallState {GHOST, SOLID, FADING}
 var _bottom_state: BottomWallState = BottomWallState.GHOST
 var _bottom_transition_tween: Tween
 var _bottom_release_timer: Timer
+var _bottom_rearm_timer: Timer
 var _bottom_fade_alpha: float = 1.0
+var _bottom_rearm_blocked: bool = false
 var _ball: BallScript
 var _bounce_count: int = 0
 var _current_frequency: float
@@ -57,7 +64,11 @@ var _label_tween: Tween
 var _label_scale_tween: Tween
 var _bullet_time_tween: Tween
 var _freeze_amount: float = 0.0
-var _time_scale_before_bullet: float = 1.0
+var _fast_forward_tween: Tween
+var _fast_forward_blend: float = 0.0
+var _fast_forward_active: bool = false
+var _fast_forward_hold_time: float = 0.0
+var _bullet_time_scale: float = 1.0
 
 func _ready() -> void:
 	_rng.randomize()
@@ -73,14 +84,32 @@ func _ready() -> void:
 		_bottom_release_timer.name = "BottomWallReleaseTimer"
 		add_child(_bottom_release_timer)
 		_bottom_release_timer.timeout.connect(_on_bottom_wall_release_timeout)
+	if not _bottom_rearm_timer:
+		_bottom_rearm_timer = Timer.new()
+		_bottom_rearm_timer.one_shot = true
+		_bottom_rearm_timer.name = "BottomWallRearmTimer"
+		add_child(_bottom_rearm_timer)
+		_bottom_rearm_timer.timeout.connect(_on_bottom_wall_rearm_timeout)
 	_build_walls()
 	_initialize_obstacle()
 	_spawn_ball()
 	set_process(true)
 
-func _process(_delta: float) -> void:
-	if Input.is_action_just_pressed("ui_accept"):
+func _process(delta: float) -> void:
+	var just_pressed := Input.is_action_just_pressed("ui_accept")
+	var just_released := Input.is_action_just_released("ui_accept")
+	var pressed := Input.is_action_pressed("ui_accept")
+	if just_pressed:
 		_request_bottom_wall_activation()
+	if pressed:
+		_fast_forward_hold_time = min(_fast_forward_hold_time + delta, FAST_FORWARD_STAGE2_END + 1.0)
+		var target_multiplier: float = _compute_fast_forward_multiplier(_fast_forward_hold_time)
+		_set_fast_forward_state(target_multiplier > 1.0, target_multiplier)
+	else:
+		_fast_forward_hold_time = 0.0
+		_set_fast_forward_state(false, 1.0)
+	if just_released and not pressed:
+		_fast_forward_hold_time = 0.0
 
 func _setup_background() -> void:
 	RenderingServer.set_default_clear_color(Color.BLACK)
@@ -196,6 +225,9 @@ func _build_bottom_wall() -> void:
 	_kill_bottom_transition_tween()
 	if _bottom_release_timer:
 		_bottom_release_timer.stop()
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.stop()
+	_bottom_rearm_blocked = false
 	_update_bottom_wall_state()
 
 func _update_bottom_wall_state() -> void:
@@ -232,10 +264,15 @@ func _set_bottom_fade_alpha(alpha: float) -> void:
 func _request_bottom_wall_activation() -> void:
 	if _bottom_state != BottomWallState.GHOST:
 		return
+	if _bottom_rearm_blocked:
+		return
 	_activate_bottom_wall()
 
 func _activate_bottom_wall() -> void:
 	_kill_bottom_transition_tween()
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.stop()
+	_bottom_rearm_blocked = false
 	_bottom_state = BottomWallState.SOLID
 	_bottom_fade_alpha = 1.0
 	_update_bottom_wall_state()
@@ -274,6 +311,40 @@ func _on_bottom_wall_fade_finished() -> void:
 	_bottom_state = BottomWallState.GHOST
 	_bottom_fade_alpha = bottom_ghost_alpha
 	_update_bottom_wall_state()
+	_schedule_bottom_wall_rearm()
+
+func _schedule_bottom_wall_rearm() -> void:
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.stop()
+	var wait_time := _get_dynamic_bottom_rearm_cooldown()
+	if wait_time <= 0.0:
+		_bottom_rearm_blocked = false
+		return
+	_bottom_rearm_blocked = true
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.wait_time = max(wait_time, 0.01)
+		_bottom_rearm_timer.start()
+
+func _on_bottom_wall_rearm_timeout() -> void:
+	_bottom_rearm_blocked = false
+
+func _get_dynamic_bottom_rearm_cooldown() -> float:
+	var base_cooldown: float = max(bottom_rearm_cooldown, bottom_rearm_cooldown_min)
+	if bottom_rearm_cooldown_min >= base_cooldown:
+		return bottom_rearm_cooldown_min
+	if not is_instance_valid(_ball):
+		return base_cooldown
+	var base_speed: float = max(_ball.initial_speed, 1.0)
+	var current_speed: float = max(_ball.get_speed(), base_speed)
+	var speed_multiplier: float = max(_ball.speed_multiplier, 1.0)
+	var max_combo_ratio: float = 1.0
+	if speed_multiplier > 1.001:
+		max_combo_ratio = pow(speed_multiplier, 19.0)
+	if max_combo_ratio <= 1.0:
+		return base_cooldown
+	var current_ratio: float = current_speed / base_speed
+	var normalized: float = clamp((current_ratio - 1.0) / (max_combo_ratio - 1.0), 0.0, 1.0)
+	return lerp(base_cooldown, bottom_rearm_cooldown_min, normalized)
 
 func _initialize_obstacle() -> void:
 	if not _obstacles_container:
@@ -552,6 +623,12 @@ func _on_incoming_obstacle_extended(obstacle: ObstacleSegment) -> void:
 		_start_obstacle_transition(next_config)
 
 func _flash_combo_effect() -> void:
+	var blur_peak := 0.0
+	if is_instance_valid(_ball):
+		var base_speed: float = max(_ball.initial_speed, 1.0)
+		var current_speed: float = _ball.get_speed()
+		var speed_ratio: float = clamp((current_speed / base_speed) - 1.0, 0.0, 1.2)
+		blur_peak = clamp(pow(speed_ratio, 0.75) * 0.85, 0.0, 1.0)
 	if _combo_label:
 		_combo_label.text = str(_bounce_count)
 		if _label_tween and _label_tween.is_running():
@@ -567,16 +644,19 @@ func _flash_combo_effect() -> void:
 	if _blur_material:
 		if _blur_tween and _blur_tween.is_running():
 			_blur_tween.kill()
-		_blur_tween = create_tween()
-		_blur_tween.tween_property(_blur_material, "shader_parameter/intensity", 0.85, 0.07).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
-		_blur_tween.tween_property(_blur_material, "shader_parameter/intensity", 0.0, 0.24).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
+		if blur_peak <= 0.001:
+			_blur_material.set_shader_parameter("intensity", 0.0)
+			_blur_tween = null
+		else:
+			_blur_tween = create_tween()
+			_blur_tween.tween_property(_blur_material, "shader_parameter/intensity", blur_peak, 0.07).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+			_blur_tween.tween_property(_blur_material, "shader_parameter/intensity", 0.0, 0.24).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
 
 func _trigger_bullet_time() -> void:
 	if _bullet_time_tween:
 		_clear_bullet_time_state()
 	_bullet_time_tween = create_tween()
 	_bullet_time_tween.set_ignore_time_scale(true)
-	_time_scale_before_bullet = Engine.time_scale
 	_set_bullet_time_state(0.0)
 	_bullet_time_tween.tween_method(Callable(self, "_set_bullet_time_state"), 0.0, 1.0, BULLET_TIME_ENTER).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
 	if BULLET_TIME_HOLD > 0.0:
@@ -586,22 +666,76 @@ func _trigger_bullet_time() -> void:
 
 func _set_bullet_time_state(amount: float) -> void:
 	var clamped: float = clamp(amount, 0.0, 1.0)
-	var target_scale: float = lerp(1.0, BULLET_TIME_SCALE, clamped)
-	Engine.time_scale = target_scale
+	_bullet_time_scale = lerp(1.0, BULLET_TIME_SCALE, clamped)
 	_set_freeze_amount(clamped)
+	_update_time_scale()
 
 func _set_freeze_amount(amount: float) -> void:
 	_freeze_amount = clamp(amount, 0.0, 1.0)
 	if _blur_material:
 		_blur_material.set_shader_parameter("freeze_amount", _freeze_amount)
 
+func _set_fast_forward_intensity(amount: float) -> void:
+	_fast_forward_blend = clamp(amount, 0.0, 2.0)
+	_update_time_scale()
+
+func _set_fast_forward_state(active: bool, target_multiplier: float = 1.0) -> void:
+	var target_blend: float = clamp(target_multiplier - 1.0, 0.0, 2.0)
+	if active == _fast_forward_active and is_equal_approx(target_blend, _fast_forward_blend):
+		return
+	if not active:
+		_fast_forward_active = false
+		if _fast_forward_tween and _fast_forward_tween.is_running():
+			_fast_forward_tween.kill()
+		_fast_forward_tween = null
+		_set_fast_forward_intensity(target_blend)
+		return
+	_fast_forward_active = true
+	if _fast_forward_tween and _fast_forward_tween.is_running():
+		_fast_forward_tween.kill()
+	_fast_forward_tween = create_tween()
+	_fast_forward_tween.set_ignore_time_scale(true)
+	var ease_type := Tween.EASE_OUT if target_blend >= _fast_forward_blend else Tween.EASE_IN
+	_fast_forward_tween.tween_method(Callable(self, "_set_fast_forward_intensity"), _fast_forward_blend, target_blend, 0.12).set_trans(Tween.TRANS_QUART).set_ease(ease_type)
+
+func _update_time_scale() -> void:
+	var fast_multiplier: float = 1.0 + clamp(_fast_forward_blend, 0.0, 2.0)
+	Engine.time_scale = _bullet_time_scale * fast_multiplier
+
+func _compute_fast_forward_multiplier(hold_time: float) -> float:
+	if hold_time < FAST_FORWARD_STAGE1_DELAY:
+		return 1.0
+	if hold_time >= FAST_FORWARD_STAGE2_END:
+		return 3.0
+	var stage_progress: float = clamp((hold_time - FAST_FORWARD_STAGE1_DELAY) / FAST_FORWARD_STAGE2_DURATION, 0.0, 1.0)
+	return lerp(2.0, 3.0, stage_progress)
+
 func _clear_bullet_time_state() -> void:
-	Engine.time_scale = _time_scale_before_bullet
-	_time_scale_before_bullet = 1.0
+	_bullet_time_scale = 1.0
 	_set_freeze_amount(0.0)
 	if _bullet_time_tween and _bullet_time_tween.is_running():
 		_bullet_time_tween.kill()
 	_bullet_time_tween = null
+	_update_time_scale()
+
+func _exit_tree() -> void:
+	if _fast_forward_tween and _fast_forward_tween.is_running():
+		_fast_forward_tween.kill()
+	_fast_forward_tween = null
+	_fast_forward_active = false
+	_fast_forward_hold_time = 0.0
+	_fast_forward_blend = 0.0
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.stop()
+	_bottom_rearm_blocked = false
+	if _bullet_time_tween and _bullet_time_tween.is_running():
+		_bullet_time_tween.kill()
+	_bullet_time_tween = null
+	_bullet_time_scale = 1.0
+	_set_freeze_amount(0.0)
+	if _blur_material:
+		_blur_material.set_shader_parameter("intensity", 0.0)
+	_set_fast_forward_intensity(0.0)
 
 func _spawn_ball() -> void:
 	_ball = BALL_SCENE.instantiate() as BallScript
@@ -678,16 +812,14 @@ func _on_obstacle_shatter_finished() -> void:
 	var retiring := _obstacle
 	_obstacle = null
 	_retiring_obstacles.append(retiring)
-	var retract_tween := retiring.retract()
-	if retract_tween:
-		retract_tween.finished.connect(Callable(self, "_on_retiring_obstacle_retracted").bind(retiring), Object.CONNECT_ONE_SHOT)
-	else:
-		_on_retiring_obstacle_retracted(retiring)
+	_on_retiring_obstacle_retracted(retiring)
 
 func _reset_round() -> void:
 	_bounce_count = 0
 	_current_frequency = base_frequency
 	_clear_bullet_time_state()
+	_set_fast_forward_state(false, 1.0)
+	_fast_forward_hold_time = 0.0
 	if is_instance_valid(_ball):
 		_ball.reset_ball(arena_rect.position + arena_rect.size * 0.5)
 	_bottom_state = BottomWallState.GHOST
@@ -695,6 +827,9 @@ func _reset_round() -> void:
 	_kill_bottom_transition_tween()
 	if _bottom_release_timer:
 		_bottom_release_timer.stop()
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.stop()
+	_bottom_rearm_blocked = false
 	_bottom_active = false
 	_update_bottom_wall_state()
 	_obstacle_animating = false

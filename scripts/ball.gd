@@ -22,7 +22,7 @@ var _bottom_touching: bool = false
 var _obstacle_contacts_prev: Dictionary = {}
 var _obstacle_contacts_current: Dictionary = {}
 var _contact_emit_this_frame: Dictionary = {}
-const SHALLOW_ANGLE_THRESHOLD_DEG := 45.0
+const SHALLOW_ANGLE_THRESHOLD_DEG := 40.0
 const SHALLOW_DURATION_THRESHOLD := 1.0
 const SHALLOW_TARGET_ANGLE_DEG := 60.0
 const SHALLOW_ARROW_FLASH_DURATION := 1.5
@@ -128,6 +128,9 @@ func restore_initial_speed() -> void:
 func boost_speed() -> void:
     var target_speed := _velocity.length() * speed_multiplier
     _velocity = _velocity.normalized() * target_speed
+
+func get_speed() -> float:
+    return _velocity.length()
 
 func set_control_wall_normal(normal: Vector2) -> void:
     if normal.length_squared() <= 0.0001:
