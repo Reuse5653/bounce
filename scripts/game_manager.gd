@@ -19,8 +19,9 @@ const FAST_FORWARD_STAGE2_END := FAST_FORWARD_STAGE1_DELAY + FAST_FORWARD_STAGE2
 @export var bottom_fade_duration: float = 0.2
 @export_range(0.0, 1.0, 0.01) var bottom_ghost_alpha: float = 0.35
 @export_range(0.0, 1.0, 0.01) var bottom_bounce_alpha_threshold: float = 0.75
-@export var bottom_rearm_cooldown: float = 0.3
-@export var bottom_rearm_cooldown_min: float = 0.1
+@export var bottom_rearm_cooldown: float = 0.1
+@export var bottom_rearm_cooldown_min: float = 0
+@export_range(0.0, 1.0, 0.01) var combo_blur_max_intensity: float = 0.35
 
 var arena_rect: Rect2
 @onready var _background_rect: ColorRect = $Background
@@ -628,7 +629,8 @@ func _flash_combo_effect() -> void:
 		var base_speed: float = max(_ball.initial_speed, 1.0)
 		var current_speed: float = _ball.get_speed()
 		var speed_ratio: float = clamp((current_speed / base_speed) - 1.0, 0.0, 1.2)
-		blur_peak = clamp(pow(speed_ratio, 0.75) * 0.85, 0.0, 1.0)
+		var intensity_factor: float = clamp(pow(speed_ratio, 0.75), 0.0, 1.0)
+		blur_peak = clamp(intensity_factor * combo_blur_max_intensity, 0.0, 1.0)
 	if _combo_label:
 		_combo_label.text = str(_bounce_count)
 		if _label_tween and _label_tween.is_running():

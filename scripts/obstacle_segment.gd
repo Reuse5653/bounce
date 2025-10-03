@@ -116,10 +116,11 @@ func _update_geometry() -> void:
     var shape := _collision.shape as RectangleShape2D
     if not shape:
         return
-    var effective_length: float = max(_current_length, 0.01)
+    var raw_length: float = max(_current_length, 0.0)
+    var effective_length: float = max(raw_length, 0.01)
     shape.size = Vector2(effective_length, thickness)
     _collision.position = Vector2(effective_length * 0.5, 0.0)
-    _collision.disabled = effective_length < 4.0
+    _collision.disabled = raw_length <= 0.001
 
     _visual.polygon = PackedVector2Array([
         Vector2(0.0, -thickness * 0.5),
