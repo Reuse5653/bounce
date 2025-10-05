@@ -14,9 +14,12 @@ signal surface_contact(collider)
 
 var _arena_rect: Rect2 = Rect2()
 var _velocity: Vector2
+var _game_manager: Node
 var _rng := RandomNumberGenerator.new()
 const BOTTOM_BOUNCE_COOLDOWN_FRAMES := 6
 const MAX_COLLISION_ITERATIONS := 6
+const COLLISION_SOUND_INTERVAL := 0.08
+const COLLISION_SOUND_MIN_NORMAL_SPEED := 60.0
 var _bottom_contact_cooldown_frames: int = 0
 var _bottom_touching: bool = false
 var _obstacle_contacts_prev: Dictionary = {}
@@ -27,6 +30,8 @@ const SHALLOW_DURATION_THRESHOLD := 1.0
 const SHALLOW_TARGET_ANGLE_DEG := 60.0
 const SHALLOW_ARROW_FLASH_DURATION := 1.5
 const SHALLOW_CORRECTION_COOLDOWN := 1.0
+const SLIDE_NORMAL_THRESHOLD := 48.0
+const SLIDE_WORLD_THRESHOLD := 22.0
 var _control_wall_normal: Vector2 = Vector2.UP
 var _control_wall_tangent: Vector2 = Vector2.RIGHT
 var _shallow_angle_timer: float = 0.0
@@ -39,6 +44,10 @@ var _last_normal_sign: float = 1.0
 var _shallow_warning_active: bool = false
 var _shallow_warning_seed: int = 0
 var _shallow_warning_time: float = 0.0
+var _shallow_correction_enabled: bool = true
+var _last_wall_velocity: Vector2 = Vector2.ZERO
+var _last_collision_sound_times: Dictionary = {}
+var _last_collision_normal: Vector2 = Vector2.UP
 
 func _ready() -> void:
     _rng.randomize()
@@ -87,7 +96,9 @@ func _physics_process(delta: float) -> void:
     if not bottom_collided_this_step:
         _bottom_touching = false
     _obstacle_contacts_prev = _obstacle_contacts_current.duplicate()
-    if _arena_rect.size != Vector2.ZERO and global_position.y > _arena_rect.position.y + _arena_rect.size.y + radius * 2.0:
+    if _game_manager and _game_manager.has_method("clamp_ball_to_arena_bounds"):
+        _game_manager.clamp_ball_to_arena_bounds(self)
+    if _should_escape(delta):
         escaped.emit()
     _update_shallow_angle_state(delta)
     if _shallow_warning_active:
@@ -98,6 +109,12 @@ func _physics_process(delta: float) -> void:
 func set_arena(rect: Rect2) -> void:
     _arena_rect = rect
 
+func set_game_manager(manager: Node) -> void:
+    _game_manager = manager
+
+func get_velocity_vector() -> Vector2:
+    return _velocity
+
 func reset_ball(origin: Vector2) -> void:
     global_position = origin
     _set_random_velocity(initial_speed)
@@ -106,6 +123,9 @@ func reset_ball(origin: Vector2) -> void:
     _bottom_touching = false
     _obstacle_contacts_prev.clear()
     _obstacle_contacts_current.clear()
+    _last_wall_velocity = Vector2.ZERO
+    _last_collision_sound_times.clear()
+    _last_collision_normal = Vector2.UP
     _shallow_angle_timer = 0.0
     _shallow_correction_active = false
     _shallow_correction_cooldown = 0.0
@@ -118,16 +138,34 @@ func reset_ball(origin: Vector2) -> void:
     _scale_tween = null
     _stop_shallow_warning_effect()
 
-func restore_initial_speed() -> void:
-    var speed := _velocity.length()
-    if speed <= 0.01:
-        _set_random_velocity(initial_speed)
+func set_shallow_correction_enabled(enabled: bool) -> void:
+    if _shallow_correction_enabled == enabled:
+        return
+    _shallow_correction_enabled = enabled
+    if not _shallow_correction_enabled:
+        if _shallow_correction_active:
+            _cancel_shallow_correction()
+        _shallow_angle_timer = 0.0
+        _shallow_correction_cooldown = 0.0
+        _stop_shallow_warning_effect()
     else:
-        _velocity = _velocity.normalized() * initial_speed
+        _shallow_angle_timer = 0.0
+        _shallow_correction_cooldown = 0.0
 
-func boost_speed() -> void:
-    var target_speed := _velocity.length() * speed_multiplier
-    _velocity = _velocity.normalized() * target_speed
+func _should_escape(delta: float) -> bool:
+    if _game_manager and _game_manager.has_method("should_ball_escape"):
+        return bool(_game_manager.should_ball_escape(self, delta))
+    if _arena_rect.size != Vector2.ZERO and global_position.y > _arena_rect.position.y + _arena_rect.size.y + radius * 2.0:
+        return true
+    return false
+
+func restore_initial_speed(wall_velocity: Vector2 = Vector2.ZERO) -> void:
+    _apply_relative_speed(initial_speed, wall_velocity)
+
+func boost_speed(wall_velocity: Vector2 = Vector2.ZERO) -> void:
+    var relative := _velocity - wall_velocity
+    var target_speed := relative.length() * speed_multiplier
+    _apply_relative_speed(target_speed, wall_velocity)
 
 func get_speed() -> float:
     return _velocity.length()
@@ -159,14 +197,40 @@ func _handle_collision(collision: KinematicCollision2D) -> bool:
         _obstacle_contacts_current[obstacle_id] = true
         if not _obstacle_contacts_prev.has(obstacle_id):
             obstacle_hit.emit(collider)
-    _velocity = _velocity.bounce(collision.get_normal())
+    var collision_point: Vector2 = collision.get_position()
+    var wall_velocity := Vector2.ZERO
+    if _game_manager and _game_manager.has_method("get_arena_surface_velocity"):
+        wall_velocity = _game_manager.get_arena_surface_velocity(collision_point)
+    var normal := collision.get_normal()
+    _last_collision_normal = normal
+    var relative_velocity_before := _velocity - wall_velocity
+    var relative_normal_speed := relative_velocity_before.dot(normal)
+    var world_normal_speed := _velocity.dot(normal)
+    var normal_speed: float = abs(relative_normal_speed)
+    var should_bounce := collided_bottom or (relative_normal_speed < -SLIDE_NORMAL_THRESHOLD and world_normal_speed < -SLIDE_WORLD_THRESHOLD)
+    var bounced_relative: Vector2
+    if should_bounce:
+        bounced_relative = relative_velocity_before.bounce(normal)
+    else:
+        bounced_relative = relative_velocity_before.slide(normal)
+    _velocity = bounced_relative + wall_velocity
+    _last_wall_velocity = wall_velocity
     if not collided_bottom:
         var contact_target := collider_node if collider_node != null else collider
         if contact_target != null and contact_target is Object:
             var contact_id := contact_target.get_instance_id()
             if contact_id != 0 and not _contact_emit_this_frame.has(contact_id):
-                surface_contact.emit(contact_target)
-                _contact_emit_this_frame[contact_id] = true
+                var allow_sound := true
+                var now: float = float(Time.get_ticks_msec()) / 1000.0
+                var last_time: float = float(_last_collision_sound_times.get(contact_id, -1000.0))
+                if now - last_time < COLLISION_SOUND_INTERVAL or normal_speed < COLLISION_SOUND_MIN_NORMAL_SPEED:
+                    allow_sound = false
+                _last_collision_sound_times[contact_id] = now
+                if _last_collision_sound_times.size() > 64:
+                    _prune_collision_sound_times(now)
+                if allow_sound:
+                    surface_contact.emit(contact_target)
+                    _contact_emit_this_frame[contact_id] = true
     _separate_from_collision(collision)
     if collided_bottom:
         _clamp_inside_arena()
@@ -175,16 +239,30 @@ func _handle_collision(collision: KinematicCollision2D) -> bool:
 func _separate_from_collision(collision: KinematicCollision2D) -> void:
     var depth := collision.get_depth()
     if depth > 0.0:
-        global_position += collision.get_normal() * (depth + 1.0)
+        global_position += collision.get_normal() * depth
 
 func _clamp_inside_arena() -> void:
+    if _game_manager and _game_manager.has_method("get_rotation_root") and _game_manager.has_method("get_arena_half_extents"):
+        var rotation_root := _game_manager.get_rotation_root() as Node2D
+        if rotation_root and is_instance_valid(rotation_root):
+            var local := rotation_root.to_local(global_position)
+            var half_extents: Vector2 = _game_manager.get_arena_half_extents()
+            var thickness := 0.0
+            if _game_manager.has_method("get_wall_thickness"):
+                thickness = _game_manager.get_wall_thickness()
+            var margin := radius + thickness * 0.5
+            var clamped_x: float = clamp(local.x, -half_extents.x + margin, half_extents.x - margin)
+            var clamped_y: float = clamp(local.y, -half_extents.y + margin, half_extents.y - margin)
+            local = Vector2(clamped_x, clamped_y)
+            global_position = rotation_root.to_global(local)
+            return
     if _arena_rect.size == Vector2.ZERO:
         return
-    var margin := radius + 2.0
-    var min_x := _arena_rect.position.x + margin
-    var max_x := _arena_rect.position.x + _arena_rect.size.x - margin
-    var min_y := _arena_rect.position.y + margin
-    var max_y := _arena_rect.position.y + _arena_rect.size.y - margin
+    var fallback_margin := radius + 2.0
+    var min_x := _arena_rect.position.x + fallback_margin
+    var max_x := _arena_rect.position.x + _arena_rect.size.x - fallback_margin
+    var min_y := _arena_rect.position.y + fallback_margin
+    var max_y := _arena_rect.position.y + _arena_rect.size.y - fallback_margin
     global_position.x = clamp(global_position.x, min_x, max_x)
     global_position.y = clamp(global_position.y, min_y, max_y)
 
@@ -192,6 +270,8 @@ func _create_speed_arrow() -> void:
     pass # obsolete (arrow removed)
 
 func _update_shallow_angle_state(delta: float) -> void:
+    if not _shallow_correction_enabled:
+        return
     var speed := _velocity.length()
     if speed <= 0.01:
         _shallow_angle_timer = 0.0
@@ -318,3 +398,27 @@ func _apply_shallow_angle_correction() -> void:
     _last_normal_sign = sign(new_direction.dot(normal_dir))
     _finalize_shallow_correction(true)
     shallow_correction_applied.emit()
+
+func get_last_wall_velocity() -> Vector2:
+    return _last_wall_velocity
+
+func _apply_relative_speed(target_speed: float, wall_velocity: Vector2) -> void:
+    var clamped_speed: float = max(target_speed, 0.01)
+    var relative := _velocity - wall_velocity
+    if relative.length() <= 0.01:
+        var direction := _last_collision_normal.normalized()
+        if direction.length_squared() <= 0.0001:
+            direction = Vector2(_rng.randf_range(-0.8, 0.8), -1.0).normalized()
+            if abs(direction.y) < 0.2:
+                direction.y = -0.2
+        relative = direction.normalized() * clamped_speed
+    else:
+        relative = relative.normalized() * clamped_speed
+    _velocity = relative + wall_velocity
+
+func _prune_collision_sound_times(current_time: float) -> void:
+    var keys := _last_collision_sound_times.keys()
+    for key in keys:
+        var timestamp: float = float(_last_collision_sound_times.get(key, -1000.0))
+        if current_time - timestamp > 1.5:
+            _last_collision_sound_times.erase(key)

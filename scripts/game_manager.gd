@@ -10,6 +10,7 @@ const BULLET_TIME_EXIT := 0.45
 const FAST_FORWARD_STAGE1_DELAY := 0.3
 const FAST_FORWARD_STAGE2_DURATION := 0.5
 const FAST_FORWARD_STAGE2_END := FAST_FORWARD_STAGE1_DELAY + FAST_FORWARD_STAGE2_DURATION
+const POINTS_PER_STAGE := 20
 
 @export var arena_size: float = 640.0
 @export var wall_thickness: float = 20.0
@@ -22,6 +23,7 @@ const FAST_FORWARD_STAGE2_END := FAST_FORWARD_STAGE1_DELAY + FAST_FORWARD_STAGE2
 @export var bottom_rearm_cooldown: float = 0.1
 @export var bottom_rearm_cooldown_min: float = 0
 @export_range(0.0, 1.0, 0.01) var combo_blur_max_intensity: float = 0.35
+@export var debug_initial_stage_id: StringName = StringName()
 
 var arena_rect: Rect2
 @onready var _background_rect: ColorRect = $Background
@@ -30,6 +32,8 @@ var arena_rect: Rect2
 @onready var _combo_label: Label = $UI/ComboCounter
 @onready var _blur_rect: ColorRect = $UI/BlurOverlay
 var _blur_material: ShaderMaterial
+var _arena_motion_root: Node2D
+var _arena_rotation_root: Node2D
 var _bottom_wall: StaticBody2D
 var _bottom_collision: CollisionShape2D
 var _bottom_visual: Polygon2D
@@ -41,6 +45,7 @@ var _bottom_release_timer: Timer
 var _bottom_rearm_timer: Timer
 var _bottom_fade_alpha: float = 1.0
 var _bottom_rearm_blocked: bool = false
+var _bottom_immediate_rearm_available: bool = false
 var _ball: BallScript
 var _bounce_count: int = 0
 var _current_frequency: float
@@ -70,12 +75,19 @@ var _fast_forward_blend: float = 0.0
 var _fast_forward_active: bool = false
 var _fast_forward_hold_time: float = 0.0
 var _bullet_time_scale: float = 1.0
+var _stage_manager: StageManager
+var _combo_label_anchor_configured := false
+var _arena_motion_prev_global: Vector2 = Vector2.ZERO
+var _arena_motion_velocity: Vector2 = Vector2.ZERO
+var _arena_rotation_prev_rotation: float = 0.0
+var _arena_rotation_angular_velocity: float = 0.0
 
 func _ready() -> void:
 	_rng.randomize()
 	_current_frequency = base_frequency
 	bottom_bounce_alpha_threshold = clamp(bottom_bounce_alpha_threshold, bottom_ghost_alpha, 1.0)
 	_recalculate_arena_rect()
+	_ensure_arena_motion_root()
 	_setup_background()
 	_setup_ui()
 	_setup_audio()
@@ -93,7 +105,12 @@ func _ready() -> void:
 		_bottom_rearm_timer.timeout.connect(_on_bottom_wall_rearm_timeout)
 	_build_walls()
 	_initialize_obstacle()
+	_reparent_to_arena_rotation_root(_walls_container)
+	_reparent_to_arena_rotation_root(_obstacles_container)
+	_initialize_stage_system()
 	_spawn_ball()
+	if debug_initial_stage_id != StringName():
+		developer_jump_to_stage(debug_initial_stage_id)
 	set_process(true)
 
 func _process(delta: float) -> void:
@@ -111,6 +128,10 @@ func _process(delta: float) -> void:
 		_set_fast_forward_state(false, 1.0)
 	if just_released and not pressed:
 		_fast_forward_hold_time = 0.0
+	if _stage_manager:
+		_stage_manager.process(delta)
+	_update_arena_motion_metrics(delta)
+	_update_combo_label_follow()
 
 func _setup_background() -> void:
 	RenderingServer.set_default_clear_color(Color.BLACK)
@@ -126,11 +147,18 @@ func _setup_ui() -> void:
 		_combo_label.scale = Vector2.ONE
 		_combo_base_color = _combo_label.modulate
 		_combo_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_combo_label.set_anchors_preset(Control.PRESET_CENTER)
+		_combo_label.anchor_left = 0.5
+		_combo_label.anchor_right = 0.5
+		_combo_label.anchor_top = 0.5
+		_combo_label.anchor_bottom = 0.5
+		_combo_label.position = Vector2.ZERO
 		_combo_label.pivot_offset = _combo_label.size * 0.5
 		var resized_callable := Callable(self, "_on_combo_label_resized")
 		if not _combo_label.is_connected("resized", resized_callable):
 			_combo_label.resized.connect(resized_callable)
 		call_deferred("_update_combo_label_pivot")
+		_combo_label_anchor_configured = true
 	if _blur_rect:
 		if not _blur_material:
 			var shader := load("res://shaders/flash_blur.gdshader") as Shader
@@ -153,6 +181,7 @@ func _on_combo_label_resized() -> void:
 func _update_combo_label_pivot() -> void:
 	if _combo_label:
 		_combo_label.pivot_offset = _combo_label.size * 0.5
+		_update_combo_label_follow()
 
 func _setup_audio() -> void:
 	_audio_player = AudioStreamPlayer.new()
@@ -165,29 +194,366 @@ func _setup_audio() -> void:
 	_audio_player.play()
 	_audio_playback = _audio_player.get_stream_playback()
 
+func _ensure_arena_motion_root() -> void:
+	if not _arena_motion_root or not is_instance_valid(_arena_motion_root):
+		if has_node("ArenaMotionRoot"):
+			_arena_motion_root = get_node("ArenaMotionRoot") as Node2D
+		else:
+			_arena_motion_root = Node2D.new()
+			_arena_motion_root.name = "ArenaMotionRoot"
+			add_child(_arena_motion_root)
+	if not _arena_rotation_root or not is_instance_valid(_arena_rotation_root):
+		if _arena_motion_root.has_node("ArenaRotationRoot"):
+			_arena_rotation_root = _arena_motion_root.get_node("ArenaRotationRoot") as Node2D
+		else:
+			_arena_rotation_root = Node2D.new()
+			_arena_rotation_root.name = "ArenaRotationRoot"
+			_arena_motion_root.add_child(_arena_rotation_root)
+	_reset_arena_roots_transform()
+
+func _reset_arena_roots_transform() -> void:
+	if _arena_motion_root:
+		_arena_motion_root.position = _get_arena_center_local()
+		_arena_motion_root.rotation = 0.0
+		_arena_motion_root.scale = Vector2.ONE
+	if _arena_rotation_root:
+		_arena_rotation_root.rotation = 0.0
+		_arena_rotation_root.scale = Vector2.ONE
+		_arena_rotation_root.position = Vector2.ZERO
+		if _stage_manager:
+			_stage_manager.update_arena_center(_arena_motion_root.position)
+	_sync_arena_motion_history()
+
+func _reparent_to_arena_rotation_root(node: Node) -> void:
+	if not node:
+		return
+	if not _arena_rotation_root:
+		return
+	if node == _arena_rotation_root:
+		return
+	var parent := node.get_parent()
+	if parent == _arena_rotation_root:
+		return
+	if parent:
+		parent.remove_child(node)
+	_arena_rotation_root.add_child(node)
+
+func _compute_arena_horizontal_offset_limit() -> float:
+	var viewport_rect := get_viewport_rect()
+	var surplus := (viewport_rect.size.x - arena_rect.size.x) * 0.5
+	if surplus <= 0.0:
+		return 0.0
+	return max(surplus - wall_thickness * 0.5, 0.0)
+
+func _get_arena_center_local() -> Vector2:
+	return arena_rect.position + arena_rect.size * 0.5
+
+func _to_arena_local(point: Vector2) -> Vector2:
+	return point - _get_arena_center_local()
+
+func _from_arena_local(point: Vector2) -> Vector2:
+	return _get_arena_center_local() + point
+
+func get_arena_motion_velocity() -> Vector2:
+	return _arena_motion_velocity
+
+func get_arena_surface_velocity(global_point: Vector2) -> Vector2:
+	var velocity := _arena_motion_velocity
+	if _arena_rotation_root and is_instance_valid(_arena_rotation_root):
+		var center := _arena_rotation_root.get_global_position()
+		var omega := _arena_rotation_angular_velocity
+		if abs(omega) > 0.0001:
+			var r := global_point - center
+			velocity += Vector2(-r.y, r.x) * omega
+	return velocity
+
+func sync_arena_motion_history() -> void:
+	_sync_arena_motion_history()
+
+func get_arena_center_global() -> Vector2:
+	if _arena_rotation_root and is_instance_valid(_arena_rotation_root):
+		return _arena_rotation_root.get_global_position()
+	return arena_rect.position + arena_rect.size * 0.5
+
+func get_arena_half_extents() -> Vector2:
+	return arena_rect.size * 0.5
+
+func launch_ball_from_center(reset_velocity: bool = true) -> void:
+	if not is_instance_valid(_ball):
+		return
+	var center := get_arena_center_global()
+	if reset_velocity:
+		_ball.reset_ball(center)
+	else:
+		_ball.global_position = center
+
+func _update_stage_context_bounds() -> void:
+	if not _stage_manager:
+		return
+	_stage_manager.update_horizontal_limit(_compute_arena_horizontal_offset_limit())
+
+func _sync_arena_motion_history() -> void:
+	if _arena_motion_root and is_instance_valid(_arena_motion_root):
+		_arena_motion_prev_global = _arena_motion_root.get_global_position()
+	else:
+		_arena_motion_prev_global = Vector2.ZERO
+	_arena_motion_velocity = Vector2.ZERO
+	if _arena_rotation_root and is_instance_valid(_arena_rotation_root):
+		_arena_rotation_prev_rotation = _arena_rotation_root.global_rotation
+	else:
+		_arena_rotation_prev_rotation = 0.0
+	_arena_rotation_angular_velocity = 0.0
+
+func _update_arena_motion_metrics(delta: float) -> void:
+	var safe_delta: float = max(delta, 0.0001)
+	if _arena_motion_root and is_instance_valid(_arena_motion_root):
+		var current_motion := _arena_motion_root.get_global_position()
+		_arena_motion_velocity = (current_motion - _arena_motion_prev_global) / safe_delta
+		_arena_motion_prev_global = current_motion
+	else:
+		_arena_motion_velocity = Vector2.ZERO
+		_arena_motion_prev_global = Vector2.ZERO
+	if _arena_rotation_root and is_instance_valid(_arena_rotation_root):
+		var current_rotation := _arena_rotation_root.global_rotation
+		var delta_rot := wrapf(current_rotation - _arena_rotation_prev_rotation, -PI, PI)
+		_arena_rotation_angular_velocity = delta_rot / safe_delta
+		_arena_rotation_prev_rotation = current_rotation
+	else:
+		_arena_rotation_angular_velocity = 0.0
+		_arena_rotation_prev_rotation = 0.0
+
+func _convert_obstacle_base(base_global: Vector2, direction: Vector2, length: float) -> Vector2:
+	var local := _to_arena_local(base_global)
+	var dir := direction.normalized()
+	if dir.length_squared() <= 0.0001:
+		return local
+	var half := arena_rect.size * 0.5
+	var margin := wall_thickness
+	var min_bounds := Vector2(-half.x + margin, -half.y + margin)
+	var max_bounds := Vector2(half.x - margin, half.y - margin)
+	var start := local
+	var end := local + dir * length
+	var shift := Vector2.ZERO
+	if abs(dir.x) > abs(dir.y):
+		var min_x: float = min(start.x, end.x)
+		var max_x: float = max(start.x, end.x)
+		if min_x < min_bounds.x:
+			shift.x = min_bounds.x - min_x
+			min_x += shift.x
+			max_x += shift.x
+		if max_x > max_bounds.x:
+			shift.x += max_bounds.x - max_x
+	else:
+		var min_y: float = min(start.y, end.y)
+		var max_y: float = max(start.y, end.y)
+		if min_y < min_bounds.y:
+			shift.y = min_bounds.y - min_y
+			min_y += shift.y
+			max_y += shift.y
+		if max_y > max_bounds.y:
+			shift.y += max_bounds.y - max_y
+	return local + shift
+
+func _prepare_obstacle_runtime_config(config: Dictionary) -> Dictionary:
+	var runtime := {}
+	var direction: Vector2 = config.get("direction", Vector2.DOWN) as Vector2
+	if direction.length_squared() <= 0.0001:
+		direction = Vector2.DOWN
+	direction = direction.normalized()
+	var length: float = float(config.get("length", wall_thickness * 2.5))
+	var base_global: Vector2 = config.get("base", _from_arena_local(Vector2.ZERO)) as Vector2
+	var local_base := _convert_obstacle_base(base_global, direction, length)
+	var corrected_base_global := _from_arena_local(local_base)
+	config["base"] = corrected_base_global
+	config["direction"] = direction
+	config["length"] = length
+	runtime["local_base"] = local_base
+	runtime["direction"] = direction
+	runtime["length"] = length
+	runtime["base_global"] = corrected_base_global
+	return runtime
+
+func _get_arena_center_screen_position() -> Vector2:
+	if _arena_rotation_root and is_instance_valid(_arena_rotation_root):
+		return _arena_rotation_root.to_global(Vector2.ZERO)
+	return arena_rect.position + arena_rect.size * 0.5
+
+func _update_combo_label_follow() -> void:
+	if not _combo_label or not _combo_label_anchor_configured:
+		return
+	var center := _get_arena_center_screen_position()
+	var pivot := _combo_label.pivot_offset
+	var scaled_pivot := Vector2(pivot.x * _combo_label.scale.x, pivot.y * _combo_label.scale.y)
+	_combo_label.global_position = center - scaled_pivot
+
+func _initialize_stage_system() -> void:
+	var context := StageContext.new()
+	context.game_manager = self
+	context.arena_root = _arena_rotation_root
+	context.motion_root = _arena_motion_root
+	context.walls_container = _walls_container
+	context.obstacles_container = _obstacles_container
+	context.rng = _rng
+	context.max_horizontal_offset = _compute_arena_horizontal_offset_limit()
+	context.motion_origin = _arena_motion_root.position if _arena_motion_root else Vector2.ZERO
+	context.arena_center_local = _arena_rotation_root.position if _arena_rotation_root else Vector2.ZERO
+	context.wall_thickness = wall_thickness
+	_stage_manager = StageManager.new(context, POINTS_PER_STAGE)
+	_stage_manager.register_stage(0, StageStaticArena.new())
+	_stage_manager.register_stage(POINTS_PER_STAGE, StageRotatingArena.new())
+	_stage_manager.activate_for_score(_bounce_count)
+
+func developer_list_stage_ids() -> Array[StringName]:
+	if not _stage_manager:
+		return []
+	return _stage_manager.get_registered_stage_ids()
+
+func developer_configure_stage_sequence(stage_ids: Array[StringName]) -> void:
+	if not _stage_manager:
+		return
+	_stage_manager.set_custom_sequence(stage_ids)
+	_stage_manager.activate_for_score(_bounce_count)
+
+func developer_clear_stage_sequence_override() -> void:
+	if not _stage_manager:
+		return
+	_stage_manager.clear_custom_sequence()
+	_stage_manager.activate_for_score(_bounce_count)
+
+func developer_clear_stage_override() -> void:
+	if not _stage_manager:
+		return
+	_stage_manager.clear_override_stage(false)
+	_stage_manager.activate_for_score(_bounce_count)
+
+func developer_jump_to_stage(stage_id: StringName, lock_stage: bool = true, restart_stage: bool = true) -> void:
+	if not _stage_manager:
+		return
+	if stage_id == StringName():
+		push_warning("developer_jump_to_stage: stage_id is empty")
+		return
+	if not _stage_manager.has_stage(stage_id):
+		push_warning("developer_jump_to_stage: unknown stage '%s'" % stage_id)
+		return
+	if lock_stage:
+		_stage_manager.set_override_stage(stage_id, false)
+	else:
+		_stage_manager.clear_override_stage(false)
+	_reset_round()
+	if lock_stage:
+		_stage_manager.set_override_stage(stage_id, restart_stage)
+	else:
+		_stage_manager.force_switch_to_stage(stage_id, restart_stage)
+
+func get_ball() -> BallScript:
+	return _ball
+
+func get_bottom_wall() -> StaticBody2D:
+	return _bottom_wall
+
+func get_bottom_wall_center() -> Vector2:
+	if _bottom_collision and is_instance_valid(_bottom_collision):
+		return _bottom_collision.to_global(Vector2.ZERO)
+	if _bottom_wall and is_instance_valid(_bottom_wall):
+		return _bottom_wall.to_global(Vector2.ZERO)
+	return Vector2.ZERO
+
+func get_control_wall_normal() -> Vector2:
+	if _bottom_wall and is_instance_valid(_bottom_wall):
+		var wall_transform := _bottom_wall.get_global_transform()
+		var interior := (-wall_transform.y).normalized()
+		if interior.length_squared() > 0.0001:
+			return interior
+	return Vector2.UP
+
+func get_motion_root() -> Node2D:
+	return _arena_motion_root
+
+func get_rotation_root() -> Node2D:
+	return _arena_rotation_root
+
+func should_ball_escape(ball: Ball, delta: float) -> bool:
+	var stage_result: Variant = null
+	if _stage_manager:
+		stage_result = _stage_manager.should_ball_escape(ball, delta)
+	if stage_result is bool and stage_result:
+		return true
+	if _is_ball_outside_arena_bounds(ball):
+		clamp_ball_to_arena_bounds(ball)
+		if _is_ball_outside_arena_bounds(ball):
+			return true
+	if stage_result is bool:
+		return false
+	return false
+
+func clamp_ball_to_arena_bounds(ball: Ball) -> void:
+	if not ball:
+		return
+	var rotation_root := get_rotation_root()
+	if not rotation_root or not is_instance_valid(rotation_root):
+		return
+	var half_extents := get_arena_half_extents()
+	if half_extents == Vector2.ZERO:
+		return
+	var margin := wall_thickness + ball.radius
+	var local_pos := rotation_root.to_local(ball.global_position)
+	var clamped_local := local_pos
+	var left_limit := -half_extents.x + margin
+	var right_limit := half_extents.x - margin
+	clamped_local.x = clamp(local_pos.x, left_limit, right_limit)
+	var top_limit := -half_extents.y + margin
+	if local_pos.y < top_limit:
+		clamped_local.y = top_limit
+	elif _bottom_active:
+		var bottom_limit := half_extents.y - margin
+		if local_pos.y > bottom_limit:
+			clamped_local.y = bottom_limit
+	if not clamped_local.is_equal_approx(local_pos):
+		ball.global_position = rotation_root.to_global(clamped_local)
+
+func _is_ball_outside_arena_bounds(ball: Ball) -> bool:
+	if not ball:
+		return false
+	var rotation_root := get_rotation_root()
+	if not rotation_root or not is_instance_valid(rotation_root):
+		return false
+	var inv := rotation_root.get_global_transform().affine_inverse()
+	var local_pos: Vector2 = inv * ball.global_position
+	var half_extents := get_arena_half_extents()
+	var margin := wall_thickness * 2.0 + ball.radius
+	if abs(local_pos.x) > half_extents.x + margin:
+		return true
+	if abs(local_pos.y) > half_extents.y + margin:
+		return true
+	return false
+
 func _recalculate_arena_rect() -> void:
 	var viewport_rect := get_viewport_rect()
 	var size := Vector2(arena_size, arena_size)
 	var center := viewport_rect.size * 0.5
 	var top_left := center - size * 0.5
 	arena_rect = Rect2(top_left, size)
+	_update_stage_context_bounds()
 
 func _build_walls() -> void:
 	if not _walls_container:
 		_walls_container = Node2D.new()
 		_walls_container.name = "Walls"
-		add_child(_walls_container)
+		_reparent_to_arena_rotation_root(_walls_container)
+	else:
+		_reparent_to_arena_rotation_root(_walls_container)
 	for child in _walls_container.get_children():
 		child.queue_free()
-	var left_wall := _create_wall_rect("WallLeft", Rect2(arena_rect.position, Vector2(wall_thickness, arena_rect.size.y)))
-	var right_wall := _create_wall_rect("WallRight", Rect2(Vector2(arena_rect.position.x + arena_rect.size.x - wall_thickness, arena_rect.position.y), Vector2(wall_thickness, arena_rect.size.y)))
-	var top_wall := _create_wall_rect("WallTop", Rect2(arena_rect.position, Vector2(arena_rect.size.x, wall_thickness)))
+	var center := _get_arena_center_local()
+	var left_wall := _create_wall_rect("WallLeft", Rect2(arena_rect.position, Vector2(wall_thickness, arena_rect.size.y)), center)
+	var right_wall := _create_wall_rect("WallRight", Rect2(Vector2(arena_rect.position.x + arena_rect.size.x - wall_thickness, arena_rect.position.y), Vector2(wall_thickness, arena_rect.size.y)), center)
+	var top_wall := _create_wall_rect("WallTop", Rect2(arena_rect.position, Vector2(arena_rect.size.x, wall_thickness)), center)
 	_walls_container.add_child(left_wall)
 	_walls_container.add_child(right_wall)
 	_walls_container.add_child(top_wall)
-	_build_bottom_wall()
+	_build_bottom_wall(center)
 
-func _create_wall_rect(wall_name: String, rect: Rect2) -> StaticBody2D:
+func _create_wall_rect(wall_name: String, rect: Rect2, center: Vector2) -> StaticBody2D:
 	var body := StaticBody2D.new()
 	body.name = wall_name
 	var collision := CollisionShape2D.new()
@@ -207,15 +573,15 @@ func _create_wall_rect(wall_name: String, rect: Rect2) -> StaticBody2D:
 	])
 	visual.color = Color.WHITE
 	body.add_child(visual)
-	body.position = rect.position
+	body.position = rect.position - center
 	return body
 
-func _build_bottom_wall() -> void:
+func _build_bottom_wall(center: Vector2) -> void:
 	var rect := Rect2(
 		Vector2(arena_rect.position.x, arena_rect.position.y + arena_rect.size.y - wall_thickness),
 		Vector2(arena_rect.size.x, wall_thickness)
 	)
-	_bottom_wall = _create_wall_rect("WallBottom", rect)
+	_bottom_wall = _create_wall_rect("WallBottom", rect, center)
 	_bottom_wall.add_to_group("bottom_wall")
 	_walls_container.add_child(_bottom_wall)
 	_bottom_collision = _bottom_wall.get_node("CollisionShape2D") as CollisionShape2D
@@ -263,9 +629,11 @@ func _set_bottom_fade_alpha(alpha: float) -> void:
 	_apply_bottom_wall_alpha(_bottom_fade_alpha)
 
 func _request_bottom_wall_activation() -> void:
-	if _bottom_state != BottomWallState.GHOST:
-		return
 	if _bottom_rearm_blocked:
+		return
+	if _bottom_state == BottomWallState.SOLID:
+		return
+	if _bottom_state == BottomWallState.FADING and not _bottom_immediate_rearm_available:
 		return
 	_activate_bottom_wall()
 
@@ -274,6 +642,8 @@ func _activate_bottom_wall() -> void:
 	if _bottom_rearm_timer:
 		_bottom_rearm_timer.stop()
 	_bottom_rearm_blocked = false
+	if _bottom_immediate_rearm_available:
+		_bottom_immediate_rearm_available = false
 	_bottom_state = BottomWallState.SOLID
 	_bottom_fade_alpha = 1.0
 	_update_bottom_wall_state()
@@ -295,6 +665,7 @@ func _on_bottom_wall_release_timeout() -> void:
 
 func _begin_bottom_wall_fade() -> void:
 	_bottom_state = BottomWallState.FADING
+	_bottom_rearm_blocked = not _bottom_immediate_rearm_available
 	_bottom_fade_alpha = 1.0
 	_update_bottom_wall_state()
 	_kill_bottom_transition_tween()
@@ -312,12 +683,19 @@ func _on_bottom_wall_fade_finished() -> void:
 	_bottom_state = BottomWallState.GHOST
 	_bottom_fade_alpha = bottom_ghost_alpha
 	_update_bottom_wall_state()
+	if _bottom_immediate_rearm_available:
+		_bottom_rearm_blocked = false
+		_bottom_immediate_rearm_available = false
+		return
 	_schedule_bottom_wall_rearm()
 
 func _schedule_bottom_wall_rearm() -> void:
+	if _bottom_immediate_rearm_available:
+		return
 	if _bottom_rearm_timer:
 		_bottom_rearm_timer.stop()
-	var wait_time := _get_dynamic_bottom_rearm_cooldown()
+	_bottom_immediate_rearm_available = false
+	var wait_time: float = _get_dynamic_bottom_rearm_cooldown()
 	if wait_time <= 0.0:
 		_bottom_rearm_blocked = false
 		return
@@ -351,16 +729,42 @@ func _initialize_obstacle() -> void:
 	if not _obstacles_container:
 		_obstacles_container = Node2D.new()
 		_obstacles_container.name = "Obstacles"
-		add_child(_obstacles_container)
+		_reparent_to_arena_rotation_root(_obstacles_container)
+	else:
+		_reparent_to_arena_rotation_root(_obstacles_container)
 	for child in _obstacles_container.get_children():
 		child.queue_free()
+	_spike_indicator = null
 	_retiring_obstacles.clear()
 	_obstacle = null
 	_incoming_obstacle = null
 	_pending_obstacle_config.clear()
+	_prime_obstacle_queue(true)
+
+func _prime_obstacle_queue(animated_indicator: bool) -> void:
+	if not _obstacles_container:
+		return
+	if is_instance_valid(_obstacle):
+		_obstacle.queue_free()
+	_obstacle = null
+	if is_instance_valid(_incoming_obstacle):
+		_incoming_obstacle.queue_free()
+	_incoming_obstacle = null
+	for retiring_obstacle in _retiring_obstacles:
+		if is_instance_valid(retiring_obstacle):
+			retiring_obstacle.queue_free()
+	_retiring_obstacles.clear()
+	_obstacle_animating = false
+	_obstacle_pending_cycle = false
+	_obstacle_broken = false
+	_obstacle_hits = 0
+	_pending_obstacle_config.clear()
+	_current_obstacle_config.clear()
 	var initial_config := _generate_obstacle_config()
-	_replace_obstacle_immediate(initial_config)
-	_prepare_next_indicator(initial_config)
+	_next_obstacle_config = initial_config.duplicate(true)
+	_prepare_obstacle_runtime_config(_next_obstacle_config)
+	_indicator_config = _next_obstacle_config.duplicate(true)
+	_show_indicator_for_config(_indicator_config, animated_indicator)
 
 func _ensure_spike_indicator() -> SpikeIndicator:
 	if not _obstacles_container:
@@ -383,6 +787,7 @@ func _prepare_next_indicator(current_config: Dictionary) -> void:
 		return
 	_next_obstacle_config = _generate_obstacle_config(current_config)
 	_indicator_config = _next_obstacle_config.duplicate(true)
+	_prepare_obstacle_runtime_config(_indicator_config)
 	_show_indicator_for_config(_indicator_config, true)
 
 func _show_indicator_for_config(config: Dictionary, animated: bool) -> void:
@@ -428,13 +833,16 @@ func _quantize_direction(direction: Vector2) -> Vector2:
 
 func _indicator_origin_for_config(base: Vector2, direction: Vector2) -> Vector2:
 	var half_tile := wall_thickness * 0.5
+	var origin := Vector2.ZERO
 	if direction == Vector2.DOWN:
-		return Vector2(base.x - half_tile, base.y)
-	if direction == Vector2.UP:
-		return Vector2(base.x - half_tile, base.y - wall_thickness)
-	if direction == Vector2.RIGHT:
-		return Vector2(base.x, base.y - half_tile)
-	return Vector2(base.x - wall_thickness, base.y - half_tile)
+		origin = Vector2(base.x - half_tile, base.y)
+	elif direction == Vector2.UP:
+		origin = Vector2(base.x - half_tile, base.y - wall_thickness)
+	elif direction == Vector2.RIGHT:
+		origin = Vector2(base.x, base.y - half_tile)
+	else:
+		origin = Vector2(base.x - wall_thickness, base.y - half_tile)
+	return _to_arena_local(origin)
 
 func _configs_equivalent(a: Dictionary, b: Dictionary) -> bool:
 	if a.is_empty() or b.is_empty():
@@ -523,10 +931,12 @@ func _apply_obstacle_config(config: Dictionary) -> void:
 	if not is_instance_valid(_obstacle):
 		return
 	_current_obstacle_config = config.duplicate(true)
-	var base: Vector2 = _current_obstacle_config.get("base", Vector2.ZERO) as Vector2
-	var direction: Vector2 = _current_obstacle_config.get("direction", Vector2.DOWN) as Vector2
-	_obstacle.configure(base, direction, wall_thickness)
-	_obstacle.set_length_immediate(_obstacle.current_length)
+	var runtime: Dictionary = _prepare_obstacle_runtime_config(_current_obstacle_config)
+	var local_base: Vector2 = runtime.get("local_base", Vector2.ZERO) as Vector2
+	var direction: Vector2 = runtime.get("direction", Vector2.DOWN) as Vector2
+	var length: float = float(runtime.get("length", wall_thickness * 2.5))
+	_obstacle.configure(local_base, direction, wall_thickness)
+	_obstacle.set_length_immediate(length)
 	_obstacle_hits = 0
 	_obstacle_broken = false
 	if _obstacle.has_method("set_damage_ratio"):
@@ -569,8 +979,11 @@ func _start_obstacle_transition(next_config: Dictionary) -> void:
 			retract_tween.finished.connect(Callable(self, "_on_retiring_obstacle_retracted").bind(old_obstacle), Object.CONNECT_ONE_SHOT)
 		else:
 			_on_retiring_obstacle_retracted(old_obstacle)
+	var runtime: Dictionary = _prepare_obstacle_runtime_config(next_config)
 	var new_obstacle := _create_obstacle_instance()
-	new_obstacle.configure(next_config.get("base", Vector2.ZERO), next_config.get("direction", Vector2.DOWN), wall_thickness)
+	var local_base: Vector2 = runtime.get("local_base", Vector2.ZERO) as Vector2
+	var direction: Vector2 = runtime.get("direction", Vector2.DOWN) as Vector2
+	new_obstacle.configure(local_base, direction, wall_thickness)
 	new_obstacle.set_length_immediate(0.0)
 	_current_obstacle_config = next_config.duplicate(true)
 	_prepare_next_indicator(_current_obstacle_config)
@@ -578,7 +991,7 @@ func _start_obstacle_transition(next_config: Dictionary) -> void:
 	_incoming_obstacle = new_obstacle
 	_obstacle_animating = true
 	_obstacle_broken = false
-	var extend_length: float = float(next_config.get("length", wall_thickness * 2.5))
+	var extend_length: float = float(runtime.get("length", wall_thickness * 2.5))
 	var extend_tween := new_obstacle.extend_to(extend_length, 0.55)
 	if extend_tween:
 		extend_tween.finished.connect(Callable(self, "_on_incoming_obstacle_extended").bind(new_obstacle), Object.CONNECT_ONE_SHOT)
@@ -588,12 +1001,16 @@ func _start_obstacle_transition(next_config: Dictionary) -> void:
 func _replace_obstacle_immediate(config: Dictionary) -> void:
 	if is_instance_valid(_obstacle):
 		_obstacle.queue_free()
+	var config_copy: Dictionary = config.duplicate(true)
+	var runtime: Dictionary = _prepare_obstacle_runtime_config(config_copy)
 	var new_obstacle := _create_obstacle_instance()
-	new_obstacle.configure(config.get("base", Vector2.ZERO), config.get("direction", Vector2.DOWN), wall_thickness)
-	var target_length: float = float(config.get("length", wall_thickness * 2.5))
+	var local_base: Vector2 = runtime.get("local_base", Vector2.ZERO) as Vector2
+	var direction: Vector2 = runtime.get("direction", Vector2.DOWN) as Vector2
+	var target_length: float = float(runtime.get("length", wall_thickness * 2.5))
+	new_obstacle.configure(local_base, direction, wall_thickness)
 	new_obstacle.set_length_immediate(target_length)
 	_obstacle = new_obstacle
-	_current_obstacle_config = config.duplicate(true)
+	_current_obstacle_config = config_copy
 	_obstacle_hits = 0
 	_obstacle_broken = false
 	_obstacle_animating = false
@@ -708,9 +1125,9 @@ func _compute_fast_forward_multiplier(hold_time: float) -> float:
 	if hold_time < FAST_FORWARD_STAGE1_DELAY:
 		return 1.0
 	if hold_time >= FAST_FORWARD_STAGE2_END:
-		return 3.0
+		return 2.5
 	var stage_progress: float = clamp((hold_time - FAST_FORWARD_STAGE1_DELAY) / FAST_FORWARD_STAGE2_DURATION, 0.0, 1.0)
-	return lerp(2.0, 3.0, stage_progress)
+	return lerp(2.0, 2.5, stage_progress)
 
 func _clear_bullet_time_state() -> void:
 	_bullet_time_scale = 1.0
@@ -741,6 +1158,7 @@ func _exit_tree() -> void:
 
 func _spawn_ball() -> void:
 	_ball = BALL_SCENE.instantiate() as BallScript
+	_ball.set_game_manager(self)
 	_ball.set_arena(arena_rect)
 	_ball.global_position = arena_rect.position + arena_rect.size * 0.5
 	_ball.set_control_wall_normal(Vector2.UP)
@@ -755,18 +1173,41 @@ func _on_ball_bottom_bounce() -> void:
 	if not _bottom_active:
 		return
 	var next_bounce := _bounce_count + 1
-	var should_reset := next_bounce % 20 == 0
+	var should_reset := next_bounce % POINTS_PER_STAGE == 0
 	if should_reset and is_instance_valid(_ball):
-		_ball.restore_initial_speed()
+		var wall_velocity := _ball.get_last_wall_velocity()
+		_ball.restore_initial_speed(wall_velocity)
 	elif is_instance_valid(_ball):
-		_ball.boost_speed()
+		var wall_velocity := _ball.get_last_wall_velocity()
+		_ball.boost_speed(wall_velocity)
 	_bounce_count = next_bounce
 	if should_reset:
 		_current_frequency = base_frequency
 	_play_bounce_tone()
 	_flash_combo_effect()
 	_force_obstacle_retract_on_bottom_bounce()
-	print("底部连击：%d" % _bounce_count)
+	_allow_immediate_bottom_rearm()
+	if _stage_manager:
+		_stage_manager.on_score_changed(_bounce_count)
+
+func _allow_immediate_bottom_rearm() -> void:
+	if _bottom_release_timer:
+		_bottom_release_timer.stop()
+	if _bottom_rearm_timer:
+		_bottom_rearm_timer.stop()
+	_bottom_immediate_rearm_available = true
+	_bottom_rearm_blocked = false
+	match _bottom_state:
+		BottomWallState.SOLID:
+			_begin_bottom_wall_fade()
+		BottomWallState.FADING:
+			if not _bottom_transition_tween:
+				var duration: float = max(bottom_fade_duration, 0.01)
+				_bottom_transition_tween = create_tween()
+				_bottom_transition_tween.tween_method(Callable(self, "_set_bottom_fade_alpha"), _bottom_fade_alpha, bottom_ghost_alpha, duration).set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_IN)
+				_bottom_transition_tween.finished.connect(_on_bottom_wall_fade_finished)
+		_:
+			_update_bottom_wall_state()
 
 func _on_ball_surface_contact(collider: Object) -> void:
 	var collider_node := collider as Node
@@ -823,7 +1264,7 @@ func _reset_round() -> void:
 	_set_fast_forward_state(false, 1.0)
 	_fast_forward_hold_time = 0.0
 	if is_instance_valid(_ball):
-		_ball.reset_ball(arena_rect.position + arena_rect.size * 0.5)
+		launch_ball_from_center()
 	_bottom_state = BottomWallState.GHOST
 	_bottom_fade_alpha = bottom_ghost_alpha
 	_kill_bottom_transition_tween()
@@ -833,23 +1274,17 @@ func _reset_round() -> void:
 		_bottom_rearm_timer.stop()
 	_bottom_rearm_blocked = false
 	_bottom_active = false
+	_bottom_immediate_rearm_available = false
 	_update_bottom_wall_state()
-	_obstacle_animating = false
-	_obstacle_pending_cycle = false
-	_obstacle_broken = false
-	_obstacle_hits = 0
-	for retiring_obstacle in _retiring_obstacles:
-		if is_instance_valid(retiring_obstacle):
-			retiring_obstacle.queue_free()
-	_retiring_obstacles.clear()
-	_pending_obstacle_config.clear()
-	_cycle_obstacle(true)
+	_prime_obstacle_queue(true)
 	if _combo_label:
 		_combo_label.text = "0"
 		_combo_label.modulate = _combo_base_color
 		_combo_label.scale = Vector2.ONE
 	if _blur_material:
 		_blur_material.set_shader_parameter("intensity", 0.0)
+	if _stage_manager:
+		_stage_manager.on_score_changed(_bounce_count)
 
 func _play_bounce_tone() -> void:
 	if not _audio_player or not _audio_playback:
